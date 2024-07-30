@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import pandas as pd
 from typing import List, Dict, Any, Tuple
 from requests.models import Response
+import base64
+import toml
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,7 +24,7 @@ dependency_files = {
 }
 
 
-class GhsGithub:
+class GhdGithub:
     def __init__(self, token: str):
         self.token = token
 
@@ -120,6 +122,42 @@ class GhsGithub:
 
         return pages_list
 
+    def list_dependencies_in_file(self, repo_full_name: str, dependency_system: str, file_path: str) -> List[Dict[str, str]]:
+        url = f"https://api.github.com/repos/{
+            repo_full_name}/contents/{file_path}"
+        response = self.github_request_exponential_backoff(
+            url, single_page=True)
+
+        if response is not None and isinstance(response, List) and len(response) > 0:
+            file_content = response[0].get('content', '')
+            file_content = base64.b64decode(file_content).decode('utf-8')
+
+            dependencies = []
+
+            if dependency_system == 'pip':
+                lines = file_content.split('\n')
+                for line in lines:
+                    if '==' in line:
+                        name, version = line.split('==')
+                        dependencies.append({name.strip(): version.strip()})
+                        print(f"Finding {dependency_system} dependencies in {
+                              repo_full_name} {file_path}: {name.strip()} {version.strip()}")
+            elif dependency_system == 'poetry or other build systems':
+                pyproject_toml = toml.loads(file_content)
+                for name, version in pyproject_toml.get('tool', {}).get('poetry', {}).get('dependencies', {}).items():
+                    dependencies.append({name: version})
+                    print(f"Finding {dependency_system} dependencies in {
+                          repo_full_name} {file_path}: {name} {version}")
+                for name, version in pyproject_toml.get('tool', {}).get('poetry', {}).get('dev-dependencies', {}).items():
+                    dependencies.append({name: version})
+                    print(f"Finding {dependency_system} dependencies in {
+                          repo_full_name} {file_path}: {name} {version}")
+
+            return dependencies
+
+        print(f"Failed to fetch file {file_path} from repo {repo_full_name}")
+        return []
+
     def search_repos_by_language_and_org(self, language: str, org: str) -> List[Dict]:
         url = f'https://api.github.com/search/repositories?q=org:{
             org}+language:{language}&per_page={MAX_ITEMS_PER_PAGE}'
@@ -175,9 +213,6 @@ class GhsGithub:
             repo_list.append(repo_info)
         return pd.DataFrame(repo_list)
 
-    # Check for dependency files in the repositories
-    # The function returns a DataFrame with the dependency management system and the dependency file,
-    # for example, 'pip' and 'requirements.txt'
     def check_dependency_files(self, df: pd.DataFrame, dependency_files: Dict[str, str]) -> pd.DataFrame:
 
         def file_exists_in_repo(repo_full_name: str, file_name: str) -> Tuple[bool, str]:
@@ -211,9 +246,44 @@ class GhsGithub:
             *df['full_name'].apply(find_dependency_management_system))
         return df
 
+    def extract_dependencies(self, df_with_dependencies: pd.DataFrame) -> pd.DataFrame:
+        dependencies_list = []
+        total_repos = len(df_with_dependencies)
+        repo_counter = 0
+
+        print(f"Starting to process {total_repos} {
+              LANGUAGE} repos for {ORGANIZATION}...")
+
+        for _, row in df_with_dependencies.iterrows():
+            repo_counter += 1
+            repo = row['full_name']
+            repo_path = row['html_url']
+            dependency_system = row['dependency_management_system']
+            dependency_file = row['dependency_file']
+
+            print(f"\rLooking at {LANGUAGE} repo {repo}. Number {
+                  repo_counter} of {total_repos}...", end='')
+
+            if dependency_system != 'Unknown' and dependency_file != 'None':
+                dependencies = self.list_dependencies_in_file(
+                    repo, dependency_system, dependency_file)
+                for dependency in dependencies:
+                    for name, version in dependency.items():
+                        dependencies_list.append({
+                            'repo': repo,
+                            'repo_path': repo_path,
+                            'dependency_management_system': dependency_system,
+                            'dependency_file': dependency_file,
+                            'dependency_name': name,
+                            'dependency_version': version
+                        })
+
+        print()  # Newline after progress output
+        return pd.DataFrame(dependencies_list)
+
 
 # Initialize the GhsGithub class
-github = GhsGithub(GITHUB_TOKEN)
+github = GhdGithub(GITHUB_TOKEN)
 
 # Search for repositories by language and organization
 repos = github.search_repos_by_language_and_org(LANGUAGE, ORGANIZATION)
@@ -228,3 +298,17 @@ print(df_with_dependencies)
 
 # Optionally, save the dataframe to a CSV file
 df_with_dependencies.to_csv('repos_with_dependencies.csv', index=False)
+
+# Extract dependencies into a new DataFrame
+dependencies_df = github.extract_dependencies(df_with_dependencies)
+print(dependencies_df)
+
+# Save the new DataFrame to a CSV file
+csv_filename = 'repo_dependencies.csv'
+dependencies_df.to_csv(csv_filename, index=False)
+
+# Summary output
+total_repos = len(df)
+total_dependencies = len(dependencies_df)
+print(f"Found {total_repos} {LANGUAGE} repos under {ORGANIZATION} and processed {
+      total_dependencies} dependencies in {csv_filename}")
